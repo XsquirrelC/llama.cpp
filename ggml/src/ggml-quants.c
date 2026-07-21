@@ -3547,6 +3547,18 @@ void quantize_row_i8_s_4x1(const float * x, void * y, int64_t n, float* act_scal
     act_sums[0] = sum;
 }
 
+void quantize_row_i8_s_prescaled(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t n, float scale) {
+    int8_t * dst = (int8_t *)y;
+    float inv_scale = (scale > 1e-10f) ? 1.0f / scale : 0.0f;
+    for (int64_t i = 0; i < n; i++) {
+        int v = nearest_int(x[i] * inv_scale);
+        if (v >  127) v = 127;
+        if (v < -128) v = -128;
+        dst[i] = (int8_t)v;
+    }
+}
+
+
 // #define QK_I2 128
 
 // size_t quantize_i2_s(const float * restrict src, void * restrict dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -16166,7 +16178,8 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
         case GGML_TYPE_I2_S:
-            // nothing to validate
+        case GGML_TYPE_I8_S:
+            // nothing to validate for integer quantized types
             break;
         default:
             {

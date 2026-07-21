@@ -447,6 +447,7 @@ extern "C" {
         GGML_OP_DUP,
         GGML_OP_ADD,
         GGML_OP_ADD1,
+        GGML_OP_ADD_SCALED, // y = a * scale + b (fused layer_scale + residual add)
         GGML_OP_ACC,
         GGML_OP_SUB,
         GGML_OP_MUL,
@@ -468,9 +469,12 @@ extern "C" {
         GGML_OP_NORM, // normalize
         GGML_OP_RMS_NORM,
         GGML_OP_RMS_NORM_BACK,
+        GGML_OP_RMS_NORM_SCALED, // I8_S: rms_norm(a) * gamma, output I8_S
         GGML_OP_GROUP_NORM,
 
         GGML_OP_MUL_MAT,
+        GGML_OP_MUL_MAT_ADD,  // fused mul_mat + add bias (for INT8 pipeline: avoids F32 round-trip)
+        GGML_OP_MUL_MAT_ADD_RELU,  // fused mul_mat + add bias + relu (INT8 pipeline)
         GGML_OP_MUL_MAT_ID,
         GGML_OP_OUT_PROD,
 
@@ -492,9 +496,11 @@ extern "C" {
         GGML_OP_ROPE,
         GGML_OP_ROPE_BACK,
         GGML_OP_CLAMP,
+        GGML_OP_CONV1D,
         GGML_OP_CONV_TRANSPOSE_1D,
         GGML_OP_IM2COL,
         GGML_OP_IM2COL_BACK,
+        GGML_OP_IM2COL_ASYM, // I8_S: im2col with fused left padding
         GGML_OP_CONV_TRANSPOSE_2D,
         GGML_OP_POOL_1D,
         GGML_OP_POOL_2D,
@@ -702,6 +708,11 @@ extern "C" {
     GGML_API int64_t ggml_cycles(void);
     GGML_API int64_t ggml_cycles_per_ms(void);
 
+    // Timing control functions
+    GGML_API void    ggml_enable_timing(bool enable);
+    GGML_API void    ggml_set_timing_csv_path(const char* path);
+    GGML_API void    ggml_close_timing(void);
+
     // accepts a UTF-8 path, even on Windows
     GGML_API FILE *  ggml_fopen(const char * fname, const char * mode);
 
@@ -877,6 +888,13 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             enum   ggml_type      type);
+
+    // y = a * scale + b (fused layer_scale + residual add)
+    GGML_API struct ggml_tensor * ggml_add_scaled(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * scale);
 
     GGML_API struct ggml_tensor * ggml_add1(
             struct ggml_context * ctx,
@@ -1159,6 +1177,14 @@ extern "C" {
             struct ggml_tensor  * a,
             float                 eps);
 
+    // rms_norm fused with per-element scale: y = rms_norm(a) * scale
+    // scale must have the same ne[0] as a
+    GGML_API struct ggml_tensor * ggml_rms_norm_scaled(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * scale,
+            float                 eps);
+
     GGML_API struct ggml_tensor * ggml_rms_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1193,6 +1219,24 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // fused matrix multiplication + bias add (for INT8 pipeline)
+    // result = a @ b + bias
+    // When a is I8_S, the bias is quantized to INT8 using the output scale
+    // and added in INT8 domain, avoiding F32 round-trip IO
+    // a: weight [OC, IC], b: input [IC, N], bias: [OC]
+    GGML_API struct ggml_tensor * ggml_mul_mat_add(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * bias);
+
+    // fused mul_mat + bias + relu (INT8 pipeline: avoids separate relu pass)
+    GGML_API struct ggml_tensor * ggml_mul_mat_add_relu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * bias);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
@@ -1605,6 +1649,20 @@ extern "C" {
             bool                  is_2D,
             enum ggml_type        dst_type);
 
+    GGML_API struct ggml_tensor * ggml_im2col_asym(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   s0,
+            int                   s1,
+            int                   lp0,
+            int                   rp0,
+            int                   p1,
+            int                   d0,
+            int                   d1,
+            bool                  is_2D,
+            enum ggml_type        dst_type);
+
     GGML_API struct ggml_tensor * ggml_im2col_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,  // convolution kernel
@@ -1630,6 +1688,15 @@ extern "C" {
             int                  d1); // dilation dimension 1
 
     GGML_API struct ggml_tensor * ggml_conv_1d(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,   // convolution kernel
+            struct ggml_tensor  * b,   // data
+            int                   s0,  // stride
+            int                   p0,  // padding
+            int                   d0); // dilation
+
+    // 1D depthwise convolution
+    GGML_API struct ggml_tensor * ggml_conv_1d_dw(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,   // convolution kernel
             struct ggml_tensor  * b,   // data
@@ -1764,6 +1831,19 @@ extern "C" {
             int                  p1,
             int                  p2,
             int                  p3);
+
+    // pad each dimension with zeros (extended version with left/right padding)
+    GGML_API struct ggml_tensor * ggml_pad_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   lp0,
+            int                   rp0,
+            int                   lp1,
+            int                   rp1,
+            int                   lp2,
+            int                   rp2,
+            int                   lp3,
+            int                   rp3);
 
     // Ref: https://github.com/CompVis/stable-diffusion/blob/main/ldm/modules/diffusionmodules/util.py#L151
     // timesteps: [N,]

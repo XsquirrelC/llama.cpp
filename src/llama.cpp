@@ -215,6 +215,7 @@ enum llm_arch {
     LLM_ARCH_GRANITE,
     LLM_ARCH_GRANITE_MOE,
     LLM_ARCH_CHAMELEON,
+    LLM_ARCH_VIBEASR_VAE,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -270,6 +271,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GRANITE,         "granite"      },
     { LLM_ARCH_GRANITE_MOE,     "granitemoe"   },
     { LLM_ARCH_CHAMELEON,       "chameleon"    },
+    { LLM_ARCH_VIBEASR_VAE,    "vibeasr-vae"  },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -1597,6 +1599,12 @@ static const std::map<llm_arch, std::map<llm_tensor, const char *>> LLM_TENSOR_N
             { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
             { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm" },
             { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm" },
+        },
+    },
+    {
+        LLM_ARCH_VIBEASR_VAE,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
         },
     },
     {
@@ -4621,6 +4629,7 @@ struct llama_model_loader {
                 case GGML_TYPE_TQ1_0:   ftype = LLAMA_FTYPE_MOSTLY_TQ1_0;   break;
                 case GGML_TYPE_TQ2_0:   ftype = LLAMA_FTYPE_MOSTLY_TQ2_0;   break;
                 case GGML_TYPE_I2_S:   ftype = LLAMA_FTYPE_MOSTLY_I2_S;   break;
+                case GGML_TYPE_I8_S:   ftype = LLAMA_FTYPE_MOSTLY_I8_S;   break;
                 case GGML_TYPE_IQ2_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ2_XXS; break;
                 case GGML_TYPE_IQ2_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ2_XS;  break;
                 case GGML_TYPE_IQ2_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ2_S;   break;
@@ -4648,7 +4657,9 @@ struct llama_model_loader {
             {
                 const int kid = gguf_find_key(meta, "general.file_type"); // TODO: use LLM_KV
                 if (kid >= 0) {
-                    ftype = (llama_ftype) gguf_get_val_u32(meta, kid);
+                    if (gguf_get_kv_type(meta, kid) == GGUF_TYPE_UINT32) {
+                        ftype = (llama_ftype) gguf_get_val_u32(meta, kid);
+                    }
                 }
             }
 
@@ -5369,6 +5380,7 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_TQ1_0:    return "TQ1_0 - 1.69 bpw ternary";
         case LLAMA_FTYPE_MOSTLY_TQ2_0:    return "TQ2_0 - 2.06 bpw ternary";
         case LLAMA_FTYPE_MOSTLY_I2_S:    return "I2_S - 2 bpw ternary";
+        case LLAMA_FTYPE_MOSTLY_I8_S:    return "I8_S - 8 bpw signed int8";
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS:  return "IQ2_XXS - 2.0625 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:   return "IQ2_XS - 2.3125 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ2_S:    return "IQ2_S - 2.5 bpw";
@@ -5493,6 +5505,13 @@ static void llm_load_hparams(
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, model.name, false);
+
+    // VAE models do not have LLM-specific hparams
+    if (model.arch == LLM_ARCH_VIBEASR_VAE) {
+        hparams.n_vocab = 0;
+        model.ftype = ml.ftype;
+        return;
+    }
 
     // get hparams kv
     ml.get_key(LLM_KV_VOCAB_SIZE, hparams.n_vocab, false) || ml.get_arr_n(LLM_KV_TOKENIZER_LIST, hparams.n_vocab);
@@ -6254,6 +6273,12 @@ static void llm_load_hparams(
 static void llm_load_vocab(
         llama_model_loader & ml,
         llama_model & model) {
+    // VAE models have no vocabulary/tokenizer
+    if (model.arch == LLM_ARCH_VIBEASR_VAE) {
+        model.vocab.type = LLAMA_VOCAB_TYPE_NONE;
+        return;
+    }
+
     auto & vocab = model.vocab;
 
     struct gguf_context * ctx = ml.meta;
@@ -9137,6 +9162,10 @@ static bool llm_load_tensors(
                         layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
                     }
                 } break;
+            case LLM_ARCH_VIBEASR_VAE:
+                {
+                    // VAE tensors are loaded by name directly, no standard LLM tensor layout
+                } break;
             default:
                 throw std::runtime_error("unknown architecture");
         }
@@ -9291,7 +9320,9 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }
 
-        llm_load_print_meta(ml, model);
+        if (model.arch != LLM_ARCH_VIBEASR_VAE) {
+            llm_load_print_meta(ml, model);
+        }
 
         if (model.vocab.type != LLAMA_VOCAB_TYPE_NONE &&
             model.hparams.n_vocab != model.vocab.id_to_token.size()) {
@@ -18392,7 +18423,7 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
-            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_I2_S) {
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_I2_S || ftype == LLAMA_FTYPE_MOSTLY_I8_S) {
                 new_type = GGML_TYPE_F16;
             }
             else if (new_type != GGML_TYPE_Q8_0) {
@@ -18417,7 +18448,7 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
                      new_type == GGML_TYPE_Q4_0_8_8) {
                 new_type = GGML_TYPE_Q4_0;
             }
-            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_I2_S) {
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_I2_S || ftype == LLAMA_FTYPE_MOSTLY_I8_S) {
                 new_type = GGML_TYPE_F16;
             }
         }
@@ -18617,6 +18648,14 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
             ++qs.n_k_quantized;
         }
     }
+    if (new_type == GGML_TYPE_I2_S || new_type == GGML_TYPE_I8_S) {
+        int nx = tensor->ne[0];
+        if (nx % 4 != 0) {
+            LLAMA_LOG_WARN("\n\n%s : tensor cols %d are not divisible by 4, required for %s", __func__, nx, ggml_type_name(new_type));
+            new_type = GGML_TYPE_F16;
+            convert_incompatible_tensor = true;
+        }
+    }
     if (convert_incompatible_tensor) {
         switch (new_type) {
             case GGML_TYPE_TQ1_0:
@@ -18731,6 +18770,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         case LLAMA_FTYPE_MOSTLY_TQ1_0:   default_type = GGML_TYPE_TQ1_0;   break;
         case LLAMA_FTYPE_MOSTLY_TQ2_0:   default_type = GGML_TYPE_TQ2_0;   break;
         case LLAMA_FTYPE_MOSTLY_I2_S:   default_type = GGML_TYPE_I2_S;   break;
+        case LLAMA_FTYPE_MOSTLY_I8_S:   default_type = GGML_TYPE_I8_S;   break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: default_type = GGML_TYPE_IQ2_XXS; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  default_type = GGML_TYPE_IQ2_XS;  break;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:   default_type = GGML_TYPE_IQ2_XS;  break;
@@ -19099,12 +19139,20 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
             // quantize each expert separately since they have different importance matrices
             new_size = 0;
-            for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
-                const float * f32_data_03 = f32_data + i03 * nelements_matrix;
-                void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
-                const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
+            if (new_type == GGML_TYPE_I8_S) {
+                // I8_S: per-tensor quantization — quantize ALL elements with a single global scale.
+                // Cannot split by ne[2] because quantize_i8_s stores scale at data+n_elements,
+                // and splitting would cause each slice's scale to be overwritten by the next slice.
+                const int64_t total_rows = nrows * tensor->ne[2];
+                new_size = llama_tensor_quantize_internal(new_type, f32_data, new_data, chunk_size, total_rows, n_per_row, imatrix, workers, 1);
+            } else {
+                for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+                    const float * f32_data_03 = f32_data + i03 * nelements_matrix;
+                    void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
+                    const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
 
-                new_size += llama_tensor_quantize_internal(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+                    new_size += llama_tensor_quantize_internal(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+                }
             }
             LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", ggml_nbytes(tensor)/1024.0/1024.0, new_size/1024.0/1024.0);
         }
@@ -20083,6 +20131,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_JAIS:
         case LLM_ARCH_RWKV6:
+        case LLM_ARCH_VIBEASR_VAE:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values

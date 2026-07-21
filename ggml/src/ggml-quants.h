@@ -53,6 +53,7 @@ void quantize_row_tq1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
 void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_i8_s (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k, float* n, int32_t* sum);
 void quantize_row_i8_s_4x1 (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k, float* n, int32_t* sum);
+void quantize_row_i8_s_prescaled(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t n, float scale);
 // void quantize_row_i8_s (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k, float* n);
 
 void quantize_row_iq3_xxs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
@@ -134,6 +135,7 @@ size_t quantize_tq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 // size_t quantize_i2_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights);
 size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_row, const float * quant_weights);
+size_t quantize_i8_s(const float * src, void * dst, int64_t nrow, int64_t n_per_row, const float * quant_weights);
 
 size_t quantize_q2_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 size_t quantize_q3_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);

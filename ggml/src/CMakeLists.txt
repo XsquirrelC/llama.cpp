@@ -1336,15 +1336,14 @@ add_library(ggml
             ../include/ggml.h
             ../include/ggml-alloc.h
             ../include/ggml-backend.h
-            ../../../../include/bitnet-lut-kernels.h
-            ../../../../include/ggml-bitnet.h
+            ../../../../include/ggml-vae-i8_s-mad.h
             ggml.c
             ggml-alloc.c
             ggml-backend.cpp
             ggml-quants.c
             ggml-quants.h
-            ../../../../src/ggml-bitnet-mad.cpp
-            ../../../../src/ggml-bitnet-lut.cpp
+            ../../../../src/ggml-lm-mad.cpp
+            ../../../../src/ggml-vae-i8_s-mad.cpp
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
             ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
             ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}
@@ -1358,6 +1357,11 @@ add_library(ggml
             ${GGML_SOURCES_CANN}      ${GGML_HEADERS_CANN}
             ggml-aarch64.c            ggml-aarch64.h
             )
+
+# Force -O0 on VAE I8_S kernel for debuggability
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set_source_files_properties(../../../../src/ggml-vae-i8_s-mad.cpp PROPERTIES COMPILE_FLAGS "-O0")
+endif()
 
 if (EMSCRIPTEN)
     set_target_properties(ggml PROPERTIES COMPILE_FLAGS "-msimd128")
