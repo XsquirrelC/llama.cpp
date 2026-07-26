@@ -12510,6 +12510,23 @@ static void ggml_compute_forward_rms_norm_scaled(
                 sum_sq += (int32_t)x_row[i] * (int32_t)x_row[i];
             }
         }
+#elif defined(__ARM_NEON)
+        {
+            int32x4_t acc0 = vdupq_n_s32(0);
+            int32x4_t acc1 = vdupq_n_s32(0);
+            int64_t i = 0;
+            for (; i + 15 < ne00; i += 16) {
+                int8x16_t v = vld1q_s8(x_row + i);
+                int16x8_t lo = vmull_s8(vget_low_s8(v), vget_low_s8(v));
+                int16x8_t hi = vmull_s8(vget_high_s8(v), vget_high_s8(v));
+                acc0 = vaddq_s32(acc0, vaddl_s16(vget_low_s16(lo), vget_high_s16(lo)));
+                acc1 = vaddq_s32(acc1, vaddl_s16(vget_low_s16(hi), vget_high_s16(hi)));
+            }
+            sum_sq = (int64_t)vaddlvq_s32(vaddq_s32(acc0, acc1));
+            for (; i < ne00; i++) {
+                sum_sq += (int32_t)x_row[i] * (int32_t)x_row[i];
+            }
+        }
 #else
         for (int64_t i = 0; i < ne00; i++) {
             sum_sq += (int32_t)x_row[i] * (int32_t)x_row[i];
@@ -12543,6 +12560,36 @@ static void ggml_compute_forward_rms_norm_scaled(
             m = _mm_max_ps(m, _mm_movehl_ps(m, m));
             m = _mm_max_ps(m, _mm_shuffle_ps(m, m, 1));
             float row_max = _mm_cvtss_f32(m);
+            if (row_max > local_absmax) local_absmax = row_max;
+            for (; i < ne00; i++) {
+                float val = (float)x_row[i] * rms_inv * gamma[i];
+                out_row[i] = val;
+                float av = val < 0.0f ? -val : val;
+                if (av > local_absmax) local_absmax = av;
+            }
+        }
+#elif defined(__ARM_NEON)
+        {
+            float32x4_t v_rms_inv = vdupq_n_f32(rms_inv);
+            float32x4_t vmax = vdupq_n_f32(0.0f);
+            int64_t i = 0;
+            for (; i + 7 < ne00; i += 8) {
+                int8x8_t xi8 = vld1_s8(x_row + i);
+                int16x8_t xi16 = vmovl_s8(xi8);
+                int32x4_t xi32_lo = vmovl_s16(vget_low_s16(xi16));
+                int32x4_t xi32_hi = vmovl_s16(vget_high_s16(xi16));
+                float32x4_t xf_lo = vcvtq_f32_s32(xi32_lo);
+                float32x4_t xf_hi = vcvtq_f32_s32(xi32_hi);
+                float32x4_t gf_lo = vld1q_f32(gamma + i);
+                float32x4_t gf_hi = vld1q_f32(gamma + i + 4);
+                float32x4_t val_lo = vmulq_f32(vmulq_f32(xf_lo, v_rms_inv), gf_lo);
+                float32x4_t val_hi = vmulq_f32(vmulq_f32(xf_hi, v_rms_inv), gf_hi);
+                vst1q_f32(out_row + i, val_lo);
+                vst1q_f32(out_row + i + 4, val_hi);
+                vmax = vmaxq_f32(vmax, vabsq_f32(val_lo));
+                vmax = vmaxq_f32(vmax, vabsq_f32(val_hi));
+            }
+            float row_max = vmaxvq_f32(vmax);
             if (row_max > local_absmax) local_absmax = row_max;
             for (; i < ne00; i++) {
                 float val = (float)x_row[i] * rms_inv * gamma[i];
@@ -12604,6 +12651,29 @@ static void ggml_compute_forward_rms_norm_scaled(
                 __m256i vi8 = _mm256_packs_epi16(vi16, vi16);
                 vi8 = _mm256_permute4x64_epi64(vi8, 0xD8);
                 _mm_storel_epi64((__m128i *)(dst_row + i), _mm256_castsi256_si128(vi8));
+            }
+            for (; i < ne00; i++) {
+                float v = src_row[i] * inv_scale;
+                v = v < -127.0f ? -127.0f : (v > 127.0f ? 127.0f : v);
+                dst_row[i] = (int8_t)roundf(v);
+            }
+        }
+#elif defined(__ARM_NEON)
+        {
+            float32x4_t v_inv_scale = vdupq_n_f32(inv_scale);
+            int64_t i = 0;
+            for (; i + 7 < ne00; i += 8) {
+                float32x4_t vf_lo = vld1q_f32(src_row + i);
+                float32x4_t vf_hi = vld1q_f32(src_row + i + 4);
+                vf_lo = vmulq_f32(vf_lo, v_inv_scale);
+                vf_hi = vmulq_f32(vf_hi, v_inv_scale);
+                int32x4_t vi32_lo = vcvtnq_s32_f32(vf_lo);
+                int32x4_t vi32_hi = vcvtnq_s32_f32(vf_hi);
+                int16x4_t vi16_lo = vqmovn_s32(vi32_lo);
+                int16x4_t vi16_hi = vqmovn_s32(vi32_hi);
+                int16x8_t vi16 = vcombine_s16(vi16_lo, vi16_hi);
+                int8x8_t vi8 = vqmovn_s16(vi16);
+                vst1_s8(dst_row + i, vi8);
             }
             for (; i < ne00; i++) {
                 float v = src_row[i] * inv_scale;
@@ -13767,11 +13837,12 @@ UseGgmlGemm2:;
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
         if (gemm && (ne11 > 3)) {
             if (src0->type == GGML_TYPE_I2_S) {
-                float tmp[(src0_end - src0_start)*(ne11 - ne11 % 4)];
+                const int64_t tmp_size = (src0_end - src0_start)*(ne11 - ne11 % 4);
+                float * tmp = (float *) malloc(tmp_size * sizeof(float));
                 const float * scale      = (float * )((uint8_t*) (src0->data) + (ne00 * ne01 / 4));
                 const float * act_scales = (const float*) ((const char *) src1_wdata + (ne11 * ne10));
                 const int32_t * act_sums   = (const int32_t*) ((const char *) act_scales + (ne11) * sizeof(float));
-                gemm(ne00, &tmp[0], src0_end - src0_start, (const char *) src0->data + src0_start * nb01 / 4,
+                gemm(ne00, tmp, src0_end - src0_start, (const char *) src0->data + src0_start * nb01 / 4,
                     (const char *) src1_wdata, ne11 - ne11 % 4, src0_end - src0_start);
                 for (int col = 0; col < ne11 - ne11 % 4; col++) {
                     for (int row = 0; row < src0_end - src0_start; row++) {
@@ -13779,6 +13850,7 @@ UseGgmlGemm2:;
                     }
                     memcpy((float *)((char *) dst->data + (col * nb1)) + src0_start, tmp + col * (src0_end - src0_start), (src0_end - src0_start) * sizeof(float));
                 }
+                free(tmp);
             }
             else {
                 gemm(ne00, (float *)((char *) dst->data) + src0_start, ne01, (const char *) src0->data + src0_start * nb01,
@@ -18756,6 +18828,104 @@ static void ggml_compute_forward_add_scaled(
         float simd_max = _mm_cvtss_f32(m);
         if (simd_max > local_absmax) local_absmax = simd_max;
     }
+#elif defined(__ARM_NEON)
+    if (gamma_ne0 != 1) {
+        const float32x4_t v_inv_a = vdupq_n_f32(1.0f / a_scale);
+        const float32x4_t v_inv_b = vdupq_n_f32(1.0f / b_scale);
+        float32x4_t vmax = vdupq_n_f32(0.0f);
+
+        int64_t i = i0;
+        int64_t row_offset = i0 % ne0;
+        if (row_offset != 0) {
+            int64_t row_end = i0 + (ne0 - row_offset);
+            if (row_end > i1) row_end = i1;
+            for (; i < row_end; i++) {
+                float gamma = gamma_data[i % ne0];
+                float val = (float)a_data[i] / a_scale * gamma + (float)b_data[i] / b_scale;
+                float_buf[i] = val;
+                float av = val < 0.0f ? -val : val;
+                if (av > local_absmax) local_absmax = av;
+            }
+        }
+        for (; i + 7 < i1; i += 8) {
+            int64_t gi = i % ne0;
+            if (gi + 8 > ne0) {
+                for (int64_t j = 0; j < 8; j++) {
+                    float gamma = gamma_data[(i + j) % ne0];
+                    float val = (float)a_data[i + j] / a_scale * gamma + (float)b_data[i + j] / b_scale;
+                    float_buf[i + j] = val;
+                    float av = val < 0.0f ? -val : val;
+                    if (av > local_absmax) local_absmax = av;
+                }
+                continue;
+            }
+            int8x8_t ai8 = vld1_s8(a_data + i);
+            int8x8_t bi8 = vld1_s8(b_data + i);
+            int16x8_t ai16 = vmovl_s8(ai8);
+            int16x8_t bi16 = vmovl_s8(bi8);
+            float32x4_t af_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(ai16)));
+            float32x4_t af_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(ai16)));
+            float32x4_t bf_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(bi16)));
+            float32x4_t bf_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(bi16)));
+            float32x4_t gf_lo = vld1q_f32(gamma_data + gi);
+            float32x4_t gf_hi = vld1q_f32(gamma_data + gi + 4);
+            float32x4_t val_lo = vaddq_f32(
+                vmulq_f32(vmulq_f32(af_lo, v_inv_a), gf_lo),
+                vmulq_f32(bf_lo, v_inv_b));
+            float32x4_t val_hi = vaddq_f32(
+                vmulq_f32(vmulq_f32(af_hi, v_inv_a), gf_hi),
+                vmulq_f32(bf_hi, v_inv_b));
+            vst1q_f32(float_buf + i, val_lo);
+            vst1q_f32(float_buf + i + 4, val_hi);
+            vmax = vmaxq_f32(vmax, vabsq_f32(val_lo));
+            vmax = vmaxq_f32(vmax, vabsq_f32(val_hi));
+        }
+        for (; i < i1; i++) {
+            float gamma = gamma_data[i % ne0];
+            float val = (float)a_data[i] / a_scale * gamma + (float)b_data[i] / b_scale;
+            float_buf[i] = val;
+            float av = val < 0.0f ? -val : val;
+            if (av > local_absmax) local_absmax = av;
+        }
+        float simd_max = vmaxvq_f32(vmax);
+        if (simd_max > local_absmax) local_absmax = simd_max;
+    } else {
+        const float gamma_scalar = gamma_data[0];
+        const float32x4_t v_inv_a = vdupq_n_f32(1.0f / a_scale);
+        const float32x4_t v_inv_b = vdupq_n_f32(1.0f / b_scale);
+        const float32x4_t v_gamma = vdupq_n_f32(gamma_scalar);
+        float32x4_t vmax = vdupq_n_f32(0.0f);
+
+        int64_t i = i0;
+        for (; i + 7 < i1; i += 8) {
+            int8x8_t ai8 = vld1_s8(a_data + i);
+            int8x8_t bi8 = vld1_s8(b_data + i);
+            int16x8_t ai16 = vmovl_s8(ai8);
+            int16x8_t bi16 = vmovl_s8(bi8);
+            float32x4_t af_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(ai16)));
+            float32x4_t af_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(ai16)));
+            float32x4_t bf_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(bi16)));
+            float32x4_t bf_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(bi16)));
+            float32x4_t val_lo = vaddq_f32(
+                vmulq_f32(vmulq_f32(af_lo, v_inv_a), v_gamma),
+                vmulq_f32(bf_lo, v_inv_b));
+            float32x4_t val_hi = vaddq_f32(
+                vmulq_f32(vmulq_f32(af_hi, v_inv_a), v_gamma),
+                vmulq_f32(bf_hi, v_inv_b));
+            vst1q_f32(float_buf + i, val_lo);
+            vst1q_f32(float_buf + i + 4, val_hi);
+            vmax = vmaxq_f32(vmax, vabsq_f32(val_lo));
+            vmax = vmaxq_f32(vmax, vabsq_f32(val_hi));
+        }
+        for (; i < i1; i++) {
+            float val = (float)a_data[i] / a_scale * gamma_scalar + (float)b_data[i] / b_scale;
+            float_buf[i] = val;
+            float av = val < 0.0f ? -val : val;
+            if (av > local_absmax) local_absmax = av;
+        }
+        float simd_max = vmaxvq_f32(vmax);
+        if (simd_max > local_absmax) local_absmax = simd_max;
+    }
 #else
     for (int64_t i = i0; i < i1; i++) {
         float gamma = gamma_data[gamma_ne0 == 1 ? 0 : (i % ne0)];
@@ -18805,6 +18975,29 @@ static void ggml_compute_forward_add_scaled(
             __m256i vi8 = _mm256_packs_epi16(vi16, vi16);
             vi8 = _mm256_permute4x64_epi64(vi8, 0xD8);
             _mm_storel_epi64((__m128i *)(dst_data + i), _mm256_castsi256_si128(vi8));
+        }
+        for (; i < i1; i++) {
+            float v = float_buf[i] * inv_scale;
+            v = v < -127.0f ? -127.0f : (v > 127.0f ? 127.0f : v);
+            dst_data[i] = (int8_t)roundf(v);
+        }
+    }
+#elif defined(__ARM_NEON)
+    {
+        float32x4_t v_inv_scale = vdupq_n_f32(inv_scale);
+        int64_t i = i0;
+        for (; i + 7 < i1; i += 8) {
+            float32x4_t vf_lo = vld1q_f32(float_buf + i);
+            float32x4_t vf_hi = vld1q_f32(float_buf + i + 4);
+            vf_lo = vmulq_f32(vf_lo, v_inv_scale);
+            vf_hi = vmulq_f32(vf_hi, v_inv_scale);
+            int32x4_t vi32_lo = vcvtnq_s32_f32(vf_lo);
+            int32x4_t vi32_hi = vcvtnq_s32_f32(vf_hi);
+            int16x4_t vi16_lo = vqmovn_s32(vi32_lo);
+            int16x4_t vi16_hi = vqmovn_s32(vi32_hi);
+            int16x8_t vi16 = vcombine_s16(vi16_lo, vi16_hi);
+            int8x8_t vi8 = vqmovn_s16(vi16);
+            vst1_s8(dst_data + i, vi8);
         }
         for (; i < i1; i++) {
             float v = float_buf[i] * inv_scale;

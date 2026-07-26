@@ -1082,7 +1082,31 @@ void ggml_gemm_i2_i8_s(int n, float * GGML_RESTRICT s, size_t bs, const void * G
 }
 
 void ggml_gemm_i8_i8(int n, int32_t * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-    
+
+#if defined(__AVX2__) || defined(__AVX__)
+    if (n == 2 && nc >= 16) {
+        const int8_t * vx_i8 = (const int8_t *)vx;
+        const int8_t * vy_i8 = (const int8_t *)vy;
+
+        for (int64_t c0 = 0; c0 < nc; c0 += 16) {
+            int64_t cur_c = (c0 + 16 <= nc) ? 16 : (nc - c0);
+            const int8_t * vx_c = vx_i8 + c0 * n;
+
+            if (cur_c == 16) {
+                ggml_vec_dot_i8_i8_n2_col16(s + c0, bs, vx_c, n, vy_i8, nr);
+            } else {
+                for (int64_t r = 0; r < nr; ++r) {
+                    const int8_t * vy_row = vy_i8 + r * n;
+                    for (int64_t cc = 0; cc < cur_c; ++cc) {
+                        ggml_vec_dot_i8_i8(n, s + r * bs + c0 + cc, 0,
+                            vx_i8 + (c0 + cc) * n, 0, vy_row, 0, 1);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     if (n == 4 && nc >= 8) {
         const int8_t * vx_i8 = (const int8_t *)vx;
         const int8_t * vy_i8 = (const int8_t *)vy;
@@ -1151,6 +1175,53 @@ void ggml_gemm_i8_i8(int n, int32_t * GGML_RESTRICT s, size_t bs, const void * G
         }
         return;
     }
+#elif defined(__ARM_NEON)
+    if (n == 4 && nc >= 2) {
+        const int8_t * vx_i8 = (const int8_t *)vx;
+        const int8_t * vy_i8 = (const int8_t *)vy;
+
+        for (int64_t c0 = 0; c0 < nc; c0 += 2) {
+            int64_t cur_c = (c0 + 2 <= nc) ? 2 : (nc - c0);
+            const int8_t * vx_c = vx_i8 + c0 * n;
+
+            if (cur_c == 2) {
+                ggml_vec_dot_i8_i8_n4_col2(s + c0, bs, vx_c, n, vy_i8, nr);
+            } else {
+                for (int64_t r = 0; r < nr; ++r) {
+                    const int8_t * vy_row = vy_i8 + r * n;
+                    for (int64_t cc = 0; cc < cur_c; ++cc) {
+                        ggml_vec_dot_i8_i8(n, s + r * bs + c0 + cc, 0,
+                            vx_i8 + (c0 + cc) * n, 0, vy_row, 0, 1);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if (n == 2 && nc >= 4) {
+        const int8_t * vx_i8 = (const int8_t *)vx;
+        const int8_t * vy_i8 = (const int8_t *)vy;
+
+        for (int64_t c0 = 0; c0 < nc; c0 += 4) {
+            int64_t cur_c = (c0 + 4 <= nc) ? 4 : (nc - c0);
+            const int8_t * vx_c = vx_i8 + c0 * n;
+
+            if (cur_c == 4) {
+                ggml_vec_dot_i8_i8_n2_col4(s + c0, bs, vx_c, n, vy_i8, nr);
+            } else {
+                for (int64_t r = 0; r < nr; ++r) {
+                    const int8_t * vy_row = vy_i8 + r * n;
+                    for (int64_t cc = 0; cc < cur_c; ++cc) {
+                        ggml_vec_dot_i8_i8(n, s + r * bs + c0 + cc, 0,
+                            vx_i8 + (c0 + cc) * n, 0, vy_row, 0, 1);
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
 
 #if defined(VAE_ACT_PARALLEL)
     const int64_t row_block = VAE_ROW_BLOCK_SIZE;
