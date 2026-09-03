@@ -3077,7 +3077,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ROPE",
     "ROPE_BACK",
     "CLAMP",
-    "CONV1D",
     "CONV_TRANSPOSE_1D",
     "IM2COL",
     "IM2COL_BACK",
@@ -3121,7 +3120,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_ADAMW",
 };
 
-static_assert(GGML_OP_COUNT == 87, "GGML_OP_COUNT != 87");
+static_assert(GGML_OP_COUNT == 86, "GGML_OP_COUNT != 86");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -3178,7 +3177,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rope(x)",
     "rope_back(x)",
     "clamp(x)",
-    "conv1d(x)",
     "conv_transpose_1d(x)",
     "im2col(x)",
     "im2col_back(x)",
@@ -3222,7 +3220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "adamw(x)",
 };
 
-static_assert(GGML_OP_COUNT == 87, "GGML_OP_COUNT != 87");
+static_assert(GGML_OP_COUNT == 86, "GGML_OP_COUNT != 86");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6792,11 +6790,11 @@ struct ggml_tensor * ggml_clamp(
     return result;
 }
 
+// ggml_conv_1d
+
 static int64_t ggml_calc_conv_output_size(int64_t ins, int64_t ks, int s, int p, int d) {
     return (ins + 2 * p - d * (ks - 1) - 1) / s + 1;
 }
-
-// ggml_conv_1d
 
 GGML_API struct ggml_tensor * ggml_conv_1d(
         struct ggml_context * ctx,
@@ -6805,14 +6803,14 @@ GGML_API struct ggml_tensor * ggml_conv_1d(
         int                   s0,
         int                   p0,
         int                   d0) {
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F32); // [IC*KW, OL, N, 1]
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F16); // [N, OL, IC * K]
 
     struct ggml_tensor * result =
         ggml_mul_mat(ctx,
-                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]),
-                ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])));
+                ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])), // [N, OL, IC * K] => [N*OL, IC * K]
+                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));                    // [OC，IC, K] => [OC, IC * K]
 
-    // result = ggml_reshape_3d(ctx, result, a->ne[2], im2col->ne[1], im2col->ne[2]);
+    result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
 
     return result;
 }
@@ -6826,41 +6824,6 @@ struct ggml_tensor* ggml_conv_1d_ph(
         int                   s,
         int                   d) {
     return ggml_conv_1d(ctx, a, b, s, a->ne[0] / 2, d);
-}
-
-// ggml_conv_1d_dw
-
-struct ggml_tensor * ggml_conv_1d_dw(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * b,
-        int                   s0,
-        int                   p0,
-        int                   d0) {
-    GGML_ASSERT(a->ne[2] == b->ne[1]);
-
-    const int64_t C = a->ne[2];
-    const int64_t L = b->ne[0];
-    const int64_t N = b->ne[2];
-
-    struct ggml_tensor * b4d = ggml_reshape_4d(ctx, b, L, 1, C, N);
-
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b4d, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F32);
-
-    struct ggml_tensor * im2d = ggml_reshape_3d(ctx, im2col,
-            im2col->ne[0], im2col->ne[1] * im2col->ne[3], im2col->ne[2]);
-
-    struct ggml_tensor * a3d = ggml_reshape_3d(ctx, a, a->ne[0], 1, C);
-
-    struct ggml_tensor * result = ggml_mul_mat(ctx, a3d, im2d);
-
-    const int64_t OL = im2col->ne[1];
-
-    result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));
-
-    result = ggml_reshape_3d(ctx, result, C, OL, N);
-
-    return result;
 }
 
 // ggml_conv_transpose_1d
@@ -7253,16 +7216,7 @@ struct ggml_tensor * ggml_pad(
         int                   p1,
         int                   p2,
         int                   p3) {
-    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type,
-            a->ne[0] + p0,
-            a->ne[1] + p1,
-            a->ne[2] + p2,
-            a->ne[3] + p3);
-
-    result->op     = GGML_OP_PAD;
-    result->src[0] = a;
-
-    return result;
+    return ggml_pad_ext(ctx, a, 0, p0, 0, p1, 0, p2, 0, p3);
 }
 
 // ggml_pad_ext
@@ -7285,7 +7239,8 @@ struct ggml_tensor * ggml_pad_ext(
             a->ne[2] + lp2 + rp2,
             a->ne[3] + lp3 + rp3);
 
-    // Store params as-is; forward uses the same convention
+    // Every GGML_OP_PAD node carries the full left/right padding, so the forward
+    // pass reads op_params unconditionally instead of inferring the variant.
     int32_t params[] = { lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3 };
     ggml_set_op_params(result, params, sizeof(params));
 
@@ -12376,7 +12331,6 @@ static void ggml_compute_forward_rms_norm_f32(
         struct ggml_tensor * dst) {
 
     const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1]; // optional scale (gamma) tensor
 
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
 
@@ -12391,8 +12345,6 @@ static void ggml_compute_forward_rms_norm_f32(
     memcpy(&eps, dst->op_params, sizeof(float));
 
     GGML_ASSERT(eps > 0.0f);
-
-    const float * gamma = src1 ? (const float *)src1->data : NULL;
 
     // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
@@ -12409,17 +12361,14 @@ static void ggml_compute_forward_rms_norm_f32(
 
                 float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
+                memcpy(y, x, ne00 * sizeof(float));
+                // for (int i00 = 0; i00 < ne00; i00++) {
+                //     y[i00] = x[i00];
+                // }
+
                 const float scale = 1.0f/sqrtf(mean + eps);
 
-                if (gamma) {
-                    // rms_norm_scaled: y = rms_norm(x) * gamma
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        y[i00] = x[i00] * scale * gamma[i00];
-                    }
-                } else {
-                    memcpy(y, x, ne00 * sizeof(float));
-                    ggml_vec_scale_f32(ne00, y, scale);
-                }
+                ggml_vec_scale_f32(ne00, y, scale);
             }
         }
     }
@@ -16795,19 +16744,15 @@ static void ggml_compute_forward_pad_f32(
 
     float * dst_ptr = (float *) dst->data;
 
-    // Check if op_params has left padding info (ggml_pad_ext sets 8 int32 params)
-    int32_t lp[4] = {0, 0, 0, 0};
-    int32_t pad_params[8];
-    memcpy(pad_params, dst->op_params, sizeof(pad_params));
-    // If any param is non-zero, this is pad_ext
-    if (pad_params[0] || pad_params[1] || pad_params[2] || pad_params[3] ||
-        pad_params[4] || pad_params[5] || pad_params[6] || pad_params[7]) {
-        // VibeASR: lp0 pads ne[1], lp1 pads ne[0]
-        lp[0] = pad_params[0];
-        lp[1] = pad_params[2];
-        lp[2] = pad_params[4];
-        lp[3] = pad_params[6];
-    }
+    // op_params layout is { lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3 }; only the
+    // left padding shifts the source index. ggml_pad routes through
+    // ggml_pad_ext, so these are always set.
+    const int32_t lp[4] = {
+        ggml_get_op_params_i32(dst, 0),
+        ggml_get_op_params_i32(dst, 2),
+        ggml_get_op_params_i32(dst, 4),
+        ggml_get_op_params_i32(dst, 6),
+    };
 
     for (int64_t i2 = 0; i2 < ne2; ++i2) {
         for (int64_t i1 = ith; i1 < ne1; i1 += nth) {
@@ -16854,17 +16799,13 @@ static void ggml_compute_forward_pad_i8_s(
     const int64_t ne2 = dst->ne[2];
     (void)dst->ne[3]; // ne3 not needed, dimensions handled via ne03
 
-    // Check for left padding params
-    int32_t lp[4] = {0, 0, 0, 0};
-    int32_t pad_params[8];
-    memcpy(pad_params, dst->op_params, sizeof(pad_params));
-    if (pad_params[0] || pad_params[1] || pad_params[2] || pad_params[3] ||
-        pad_params[4] || pad_params[5] || pad_params[6] || pad_params[7]) {
-        lp[0] = pad_params[0];
-        lp[1] = pad_params[2];
-        lp[2] = pad_params[4];
-        lp[3] = pad_params[6];
-    }
+    // Left padding only; op_params layout matches ggml_pad_ext.
+    const int32_t lp[4] = {
+        ggml_get_op_params_i32(dst, 0),
+        ggml_get_op_params_i32(dst, 2),
+        ggml_get_op_params_i32(dst, 4),
+        ggml_get_op_params_i32(dst, 6),
+    };
 
     int8_t * dst_ptr = (int8_t *) dst->data;
 
@@ -19643,10 +19584,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_im2col_i8_s(params, tensor);
             } break;
-        case GGML_OP_CONV1D:
-            {
-                GGML_ABORT("GGML_OP_CONV1D unused - dw conv uses im2col + mul_mat");
-            } break;
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
                 ggml_compute_forward_conv_transpose_2d(params, tensor);
@@ -20955,7 +20892,6 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_MUL_MAT_ADD_RELU:
         case GGML_OP_RMS_NORM_SCALED:
         case GGML_OP_IM2COL_ASYM:
-        case GGML_OP_CONV1D:
         case GGML_OP_NONE:
             {
                 // nop
@@ -21486,6 +21422,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                     } break;
 
                 case GGML_UNARY_OP_RELU:
+                    {
+                        // The I8_S kernel splits the tensor across threads; F32
+                        // keeps the single-task behaviour of the F32 kernel.
+                        n_tasks = node->type == GGML_TYPE_I8_S ? n_threads : 1;
+                    } break;
+
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_SILU:
@@ -21514,8 +21456,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT_ID:
+            {
+                n_tasks = n_threads;
+            } break;
         case GGML_OP_GET_ROWS:
             {
+                // FIXME: get_rows can use additional threads, but the cost of launching additional threads
+                // decreases performance with GPU offloading
+                //n_tasks = n_threads;
                 n_tasks = 1;
             } break;
         case GGML_OP_SCALE:
@@ -21549,7 +21497,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_BACK:
         case GGML_OP_IM2COL_ASYM:
-        case GGML_OP_CONV1D:
         case GGML_OP_CONV_TRANSPOSE_1D:
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
