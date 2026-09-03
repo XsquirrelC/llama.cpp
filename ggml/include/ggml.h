@@ -496,7 +496,6 @@ extern "C" {
         GGML_OP_ROPE,
         GGML_OP_ROPE_BACK,
         GGML_OP_CLAMP,
-        GGML_OP_CONV1D,
         GGML_OP_CONV_TRANSPOSE_1D,
         GGML_OP_IM2COL,
         GGML_OP_IM2COL_BACK,
@@ -1688,15 +1687,6 @@ extern "C" {
             int                  d1); // dilation dimension 1
 
     GGML_API struct ggml_tensor * ggml_conv_1d(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,   // convolution kernel
-            struct ggml_tensor  * b,   // data
-            int                   s0,  // stride
-            int                   p0,  // padding
-            int                   d0); // dilation
-
-    // 1D depthwise convolution
-    GGML_API struct ggml_tensor * ggml_conv_1d_dw(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,   // convolution kernel
             struct ggml_tensor  * b,   // data
