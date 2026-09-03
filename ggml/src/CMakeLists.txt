@@ -1152,15 +1152,31 @@ if (CMAKE_OSX_ARCHITECTURES      STREQUAL "arm64" OR
             list(APPEND ARCH_FLAGS -march=armv8.6-a+sve)
         endif()
 
+        # Gate -march=armv8.2-a+dotprod on the target CPU, not on whether the compiler
+        # accepts the flag: armv8.2-a implies armv8.1-a, so GCC inlines LSE atomics and
+        # ggml_init() SIGILLs on a plain ARMv8.0-A part (Cortex-A53/A72). Cross builds
+        # cannot probe the target, so they need GGML_ARM_DOTPROD set explicitly.
+        option(GGML_ARM_DOTPROD "ggml: assume the target ARM CPU implements dotprod (ARMv8.2 SDOT/UDOT)" OFF)
+
+        set(GGML_TARGET_SUPPORT_DOTPROD ${GGML_ARM_DOTPROD})
+        if (NOT GGML_TARGET_SUPPORT_DOTPROD AND NOT CMAKE_CROSSCOMPILING AND EXISTS "/proc/cpuinfo")
+            file(READ "/proc/cpuinfo" GGML_ARM_CPUINFO)
+            if (GGML_ARM_CPUINFO MATCHES "asimddp")
+                set(GGML_TARGET_SUPPORT_DOTPROD ON)
+            endif()
+        endif()
+
         check_cxx_source_compiles("#include <arm_neon.h>\nint main(){ int8x16_t a{}, b{}; int32x4_t s = vdupq_n_s32(0); s = vdotq_s32(s,a,b); (void)s; return 0; }" GGML_COMPILER_SUPPORT_DOTPROD)
         if (GGML_COMPILER_SUPPORT_DOTPROD)
             add_compile_definitions(__ARM_FEATURE_DOTPROD)
-        else()
+        elseif (GGML_TARGET_SUPPORT_DOTPROD)
             check_cxx_compiler_flag("-march=armv8.2-a+dotprod" COMPILER_SUPPORTS_ARMV82_DOTPROD)
             if (COMPILER_SUPPORTS_ARMV82_DOTPROD)
                 list(APPEND ARCH_FLAGS -march=armv8.2-a+dotprod)
                 add_compile_definitions(__ARM_FEATURE_DOTPROD)
             endif()
+        else()
+            message(STATUS "ARM: target CPU has no dotprod (asimddp); staying on the ARMv8.0-A baseline")
         endif()
     endif()
 elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LWR MATCHES "^(x86_64|i686|amd64|x64|win32)$" OR
