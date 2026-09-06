@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "ggml-aarch64.h"
 #include "ggml-vae-i8_s-mad.h"
+#include "vae-config.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -9307,12 +9308,6 @@ static void ggml_compute_forward_dup(
 
     if (src0->type == dst->type) {
         if (src0->type == GGML_TYPE_I8_S) {
-            // I8_S: per-tensor scale (one float at data + n_elements)
-            // Single-threaded element-wise copy
-            if (params->ith != 0) {
-                return;
-            }
-
             GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
 
             const int64_t ne0 = src0->ne[0];
@@ -9323,21 +9318,39 @@ static void ggml_compute_forward_dup(
 
             int8_t * dst_data = (int8_t *)dst->data;
 
+            // Split the [ne3, ne2, ne1] row space across threads. Byte-at-a-time
+            // assignment beats the generic dup_bytes path, whose fallback issues
+            // a libc memcpy() per element because type_size is not a constant.
+            const int64_t nr  = ne1;
+            const int64_t dr  = (nr + params->nth - 1) / params->nth;
+            const int64_t ir0 = dr * params->ith;
+            const int64_t ir1 = MIN(ir0 + dr, nr);
+
             for (int64_t i3 = 0; i3 < ne3; i3++) {
                 for (int64_t i2 = 0; i2 < ne2; i2++) {
-                    for (int64_t i1 = 0; i1 < ne1; i1++) {
-                        for (int64_t i0 = 0; i0 < ne0; i0++) {
-                            const int8_t * src_ptr = (const int8_t *)((const char *)src0->data +
-                                i3*src0->nb[3] + i2*src0->nb[2] + i1*src0->nb[1] + i0*src0->nb[0]);
-                            dst_data[((i3*ne2 + i2)*ne1 + i1)*ne0 + i0] = *src_ptr;
+                    for (int64_t i1 = ir0; i1 < ir1; i1++) {
+                        const char * src_row = (const char *)src0->data +
+                            i3*src0->nb[3] + i2*src0->nb[2] + i1*src0->nb[1];
+                        int8_t * dst_row = dst_data + ((i3*ne2 + i2)*ne1 + i1)*ne0;
+                        if (src0->nb[0] == 1) {
+                            memcpy(dst_row, src_row, ne0);
+                        } else {
+                            for (int64_t i0 = 0; i0 < ne0; i0++) {
+                                dst_row[i0] = *(const int8_t *)(src_row + i0*src0->nb[0]);
+                            }
                         }
                     }
                 }
             }
 
-            // Copy per-tensor scale
-            const float scale = *(const float *)((const char *)src0->data + n_elements);
-            *(float *)(dst_data + n_elements) = scale;
+            // The per-tensor scale sits past the last element and is not part of
+            // the copy above. Read it through view_src: the permuted views
+            // ggml_cont() gets have no scale of their own.
+            if (params->ith == 0) {
+                const struct ggml_tensor * scale_src = src0->view_src ? src0->view_src : src0;
+                *(float *)(dst_data + n_elements) =
+                    *(const float *)((const char *)scale_src->data + ggml_nelements(scale_src));
+            }
             return;
         }
         ggml_compute_forward_dup_bytes(params, dst);
@@ -19021,9 +19034,243 @@ static void ggml_compute_forward_add_scaled(
 
 // ggml_compute_forward_mul_mat_add
 
-static void ggml_compute_forward_mul_mat_add(
+// float_buf[j] = acc[j]*d + bias[j*bias_stride], returning max(|float_buf[j]|)
+// folded into amax. bias_stride is 0 on the depthwise path, where one scalar
+// bias covers a whole channel row, and 1 on the [IC, OC] matmul path.
+//
+// This is a second full pass over every output element, so at the contraction
+// lengths the encoder uses it costs about as much as the dot products do.
+// Vectorizing it is exact: max over floats is order-independent, and the
+// multiply and add stay separate so the scalar tail agrees with the body.
+static inline float ggml_i8_s_scale_bias_absmax(
+        float * GGML_RESTRICT float_buf,
+        const int32_t * GGML_RESTRICT acc,
+        const float * GGML_RESTRICT bias,
+        int64_t bias_stride,
+        int64_t n,
+        float d,
+        float amax) {
+
+    int64_t i = 0;
+
+#if defined(__AVX2__)
+    const __m256 v_d   = _mm256_set1_ps(d);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 v_b0  = _mm256_set1_ps(n > 0 ? bias[0] : 0.0f);
+
+    __m256 v_amax = _mm256_setzero_ps();
+
+    for (; i + 8 <= n; i += 8) {
+        const __m256 v = _mm256_add_ps(
+            _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_loadu_si256((const __m256i *)(acc + i))), v_d),
+            bias_stride ? _mm256_loadu_ps(bias + i) : v_b0);
+
+        _mm256_storeu_ps(float_buf + i, v);
+
+        v_amax = _mm256_max_ps(v_amax, _mm256_and_ps(v, v_abs));
+    }
+
+    if (i > 0) {
+        __m128 r = _mm_max_ps(_mm256_castps256_ps128(v_amax), _mm256_extractf128_ps(v_amax, 1));
+        r = _mm_max_ps(r, _mm_movehl_ps(r, r));
+        r = _mm_max_ss(r, _mm_shuffle_ps(r, r, 1));
+
+        const float v = _mm_cvtss_f32(r);
+        if (v > amax) amax = v;
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    const float32x4_t v_d  = vdupq_n_f32(d);
+    const float32x4_t v_b0 = vdupq_n_f32(n > 0 ? bias[0] : 0.0f);
+
+    float32x4_t v_amax = vdupq_n_f32(0.0f);
+
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t v = vaddq_f32(
+            vmulq_f32(vcvtq_f32_s32(vld1q_s32(acc + i)), v_d),
+            bias_stride ? vld1q_f32(bias + i) : v_b0);
+
+        vst1q_f32(float_buf + i, v);
+
+        v_amax = vmaxq_f32(v_amax, vabsq_f32(v));
+    }
+
+    if (i > 0) {
+        const float v = vmaxvq_f32(v_amax);
+        if (v > amax) amax = v;
+    }
+#endif
+
+    for (; i < n; ++i) {
+        const float v = (float)acc[i]*d + bias[i*bias_stride];
+
+        float_buf[i] = v;
+
+        const float av = v < 0.0f ? -v : v;
+        if (av > amax) amax = av;
+    }
+
+    return amax;
+}
+
+// dst[j] = clamp(float_buf[j]*id) rounded to int8, with relu folded into the
+// lower clamp bound: rounding first and then clamping negatives to 0 gives the
+// same byte for every input, since roundf never turns a negative into a
+// positive.
+//
+// The scalar tail uses rintf() rather than roundf(): roundf() is a libm call per
+// element and rounds ties away from zero, while rintf() inlines to one
+// instruction and rounds ties to even, matching _mm256_cvtps_epi32 and
+// vcvtnq_s32_f32 so the tail cannot disagree with the vector body. Only exact
+// .5 ties are affected, i.e. one int8 LSB, which is well inside the encoder's
+// existing requantization noise.
+static inline void ggml_i8_s_quantize_range(
+        int8_t * GGML_RESTRICT dst,
+        const float * GGML_RESTRICT float_buf,
+        int64_t n,
+        float id,
+        bool relu) {
+
+    int64_t i = 0;
+
+    const float lo = relu ? 0.0f : -127.0f;
+
+#if defined(__AVX2__)
+    const __m256 v_id = _mm256_set1_ps(id);
+    const __m256 v_lo = _mm256_set1_ps(lo);
+    const __m256 v_hi = _mm256_set1_ps(127.0f);
+
+    for (; i + 8 <= n; i += 8) {
+        __m256 vf = _mm256_mul_ps(_mm256_loadu_ps(float_buf + i), v_id);
+        vf = _mm256_min_ps(_mm256_max_ps(vf, v_lo), v_hi);
+
+        const __m256i vi32 = _mm256_cvtps_epi32(vf);
+
+        const __m256i vi16 = _mm256_permute4x64_epi64(_mm256_packs_epi32(vi32, vi32), 0xD8);
+        const __m256i vi8  = _mm256_permute4x64_epi64(_mm256_packs_epi16(vi16, vi16), 0xD8);
+
+        _mm_storel_epi64((__m128i *)(dst + i), _mm256_castsi256_si128(vi8));
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    const float32x4_t v_id = vdupq_n_f32(id);
+    const float32x4_t v_lo = vdupq_n_f32(lo);
+    const float32x4_t v_hi = vdupq_n_f32(127.0f);
+
+    for (; i + 8 <= n; i += 8) {
+        float32x4_t f0 = vmulq_f32(vld1q_f32(float_buf + i    ), v_id);
+        float32x4_t f1 = vmulq_f32(vld1q_f32(float_buf + i + 4), v_id);
+
+        f0 = vminq_f32(vmaxq_f32(f0, v_lo), v_hi);
+        f1 = vminq_f32(vmaxq_f32(f1, v_lo), v_hi);
+
+        const int16x8_t vi16 = vcombine_s16(vqmovn_s32(vcvtnq_s32_f32(f0)),
+                                            vqmovn_s32(vcvtnq_s32_f32(f1)));
+
+        vst1_s8(dst + i, vqmovn_s16(vi16));
+    }
+#endif
+
+    for (; i < n; ++i) {
+        float v = float_buf[i] * id;
+        v = v < lo ? lo : (v > 127.0f ? 127.0f : v);
+        dst[i] = (int8_t)rintf(v);
+    }
+}
+
+// Reduce the per-thread absmax stored in thread_max[nth] to a single value that
+// every thread can see. Both barriers are needed: the first makes sure all of
+// float_buf has been written before the output scale is derived from it, the
+// second makes sure no thread quantizes before the scale exists.
+static float ggml_i8_s_reduce_absmax(
         const struct ggml_compute_params * params,
-        struct ggml_tensor * dst) {
+        float * thread_max,
+        float local_absmax) {
+
+    thread_max[params->ith] = local_absmax;
+
+    ggml_barrier(params->threadpool);
+
+    if (params->ith == 0) {
+        float global_max = 0.0f;
+        for (int t = 0; t < params->nth; t++) {
+            if (thread_max[t] > global_max) global_max = thread_max[t];
+        }
+        thread_max[0] = global_max;
+    }
+
+    ggml_barrier(params->threadpool);
+
+    return thread_max[0];
+}
+
+// Blocked int8 x int8 GEMM for the linear/conv path, with the dequant epilogue
+// fused into each tile: ggml_gemm_i8_i8 writes the int32 dot products of one
+// tile into a small stack accumulator and they are turned into f32 (scale +
+// bias) right away, so they never round-trip through a [N, OC] int32 scratch
+// buffer.
+//
+// Tile geometry comes from the knobs in vae-config.h. Their names follow the
+// ggml_vec_dot_i8_i8 convention, which is transposed relative to the naming
+// used here, so to be explicit:
+//
+//   VAE_ROW_BLOCK_SIZE  input columns per tile   (the N axis of src1)
+//   VAE_COL_BLOCK_SIZE  output channels per tile (the OC axis of src0)
+//
+// The column block is the outer loop. Example: encoder stage 4 has IC = 512,
+// OC = 2048 (weights 1 MiB) and N = 1051 columns, so at 8 threads one thread
+// owns 132 columns. Sweeping column by column would stream those 1 MiB of
+// weights 132 times; with VAE_ROW_BLOCK_SIZE = 16 it streams them 9 times
+// instead, because the block's 16 x 512 B of activations stay in L1 while all
+// 2048 weight rows walk past. Inside that, each VAE_COL_BLOCK_SIZE-row weight
+// block is reused by all 16 columns of the block, and the f32 results for those
+// columns are written as VAE_COL_BLOCK_SIZE-float contiguous runs.
+//
+// Returns the running absmax, extended by the tiles this call wrote.
+static float ggml_i8_s_gemm_fused(
+              float  * GGML_RESTRICT float_buf,  // [N, OC] f32, column stride ne01
+        const int8_t * GGML_RESTRICT weight,     // [OC, IC], row stride ne00
+        const int8_t * GGML_RESTRICT input,      // [IC, N], column stride ne00
+        const float  * GGML_RESTRICT bias,       // [OC]
+        int64_t ne00,                            // IC
+        int64_t ne01,                            // OC
+        int64_t col0,                            // column range owned by this thread
+        int64_t col1,
+        float   d,                               // combined weight/input scale
+        float   amax) {
+
+    int32_t acc[VAE_ROW_BLOCK_SIZE * VAE_COL_BLOCK_SIZE];
+
+    for (int64_t c0 = col0; c0 < col1; c0 += VAE_ROW_BLOCK_SIZE) {
+        const int64_t  ncol  = MIN((int64_t) VAE_ROW_BLOCK_SIZE, col1 - c0);
+        const int8_t * x_blk = input + c0 * ne00;
+
+        for (int64_t oc0 = 0; oc0 < ne01; oc0 += VAE_COL_BLOCK_SIZE) {
+            const int64_t noc = MIN((int64_t) VAE_COL_BLOCK_SIZE, ne01 - oc0);
+
+            // acc is [ncol, noc] with row stride noc: one row per column, laid
+            // out like float_buf so the epilogue reads and writes contiguously.
+            ggml_gemm_i8_i8((int) ne00, acc, (size_t) noc,
+                            weight + oc0 * ne00, x_blk, (int) ncol, (int) noc);
+
+            for (int64_t c = 0; c < ncol; c++) {
+                amax = ggml_i8_s_scale_bias_absmax(
+                    float_buf + (c0 + c) * ne01 + oc0, acc + c * noc,
+                    bias + oc0, /*bias_stride =*/ 1,
+                    noc, d, amax);
+            }
+        }
+    }
+
+    return amax;
+}
+
+// int8 GEMM + bias + requantize back to I8_S, optionally with ReLU.
+//   src0 weight [IC, OC] I8_S   src1 input [IC, N] I8_S   src2 bias [OC] F32
+// Depthwise convolutions arrive as ne01 == 1 with one filter per channel in
+// ne02 and take a separate path.
+static void ggml_compute_forward_mul_mat_add_impl(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst,
+        bool relu) {
 
     const struct ggml_tensor * src0 = dst->src[0];  // weight
     const struct ggml_tensor * src1 = dst->src[1];  // input
@@ -19032,388 +19279,111 @@ static void ggml_compute_forward_mul_mat_add(
     GGML_ASSERT(src0->type == GGML_TYPE_I8_S);
 
     const int64_t ne00 = src0->ne[0]; // IC (or KW for dw)
-    const int64_t ne01 = src0->ne[1]; // OC (or 1 for dw)
-    const int64_t ne02 = src0->ne[2]; // 1 (or C for dw)
+    const int64_t ne01 = src0->ne[1]; // OC (or 1  for dw)
+    const int64_t ne02 = src0->ne[2]; // 1  (or C  for dw)
     const int64_t ne11 = src1->ne[1]; // N (columns)
 
     const int ith = params->ith;
     const int nth = params->nth;
 
+    const bool depthwise = (ne01 == 1 && ne02 > 1);
+
+    // Physical rows per output column: C for depthwise, OC for linear.
+    const int64_t nrow = depthwise ? ne02 : ne01;
+
     const float * bias_data = (const float *)src2->data;
 
     const float w_scale   = *(const float *)((const char *)src0->data + ggml_nelements(src0));
     const float inp_scale = *(const float *)((const char *)src1->data + ggml_nelements(src1));
     const float combined_scale = w_scale / inp_scale;
 
-    if (ne01 == 1 && ne02 > 1) {
+    // Shared work buffer layout:
+    //   [0 .. ne11*nrow)          f32 results
+    //   [ne11*nrow .. +nth)       per-thread absmax
+    //   after that                int32 accumulator slab (depthwise only)
+    float * float_buf  = (float *)params->wdata;
+    float * thread_max = float_buf + ne11 * nrow;
 
-        const int64_t C = ne02;
-        const int64_t N_cols = ne11;
-        const int64_t n_out = N_cols * C;
+    // Parallelize over columns (N dimension)
+    const int64_t dr     = (ne11 + nth - 1) / nth;
+    const int64_t col0   = MIN(dr * ith, ne11);
+    const int64_t col1   = MIN(col0 + dr, ne11);
+    const int64_t n_cols = col1 - col0;
 
-        float * float_buf  = (float *)params->wdata;
-        float * thread_max = float_buf + n_out;
+    // --- Step 1: GEMM + dequant + bias, tracking this thread's absmax ---
+    float local_absmax = 0.0f;
 
-        // Parallelize over columns (N dimension)
-        const int64_t dr   = (N_cols + nth - 1) / nth;
-        const int64_t col0 = dr * ith;
-        const int64_t col1 = col0 + dr < N_cols ? col0 + dr : N_cols;
-
-        // --- Step 1: GEMM + dequant + bias, find local absmax ---
-        float local_absmax = 0.0f;
-
-        if (col0 < col1) {
-            const int64_t n_cols = col1 - col0;
-
-            // Use pre-allocated int32 accumulator from work buffer
-            int32_t * acc_base = (int32_t *)(thread_max + nth);
-            int32_t * acc_buf = acc_base + col0 * C;
-            memset(acc_buf, 0, n_cols * C * sizeof(int32_t));
+    if (n_cols > 0) {
+        if (depthwise) {
+            // src1 layout is [KW, N, C]; float_buf and dst are [C, N].
+            // The kernel assigns rather than accumulates, so acc needs no clear.
+            int32_t * acc_buf = (int32_t *)(thread_max + nth) + col0 * ne02;
 
             const int8_t * weight_data = (const int8_t *)src0->data;
-            // src1 layout: [KW, N, C] — channel stride is N_cols * ne00
             const int8_t * input_base  = (const int8_t *)src1->data;
 
-            // Call kernel per channel to handle correct stride
-            for (int64_t ch = 0; ch < C; ch++) {
-                const int8_t * w_ch   = weight_data + ch * ne00;
-                const int8_t * inp_ch = input_base + ch * N_cols * ne00 + col0 * ne00;
-                int32_t * out_ch      = acc_buf + ch * n_cols;
-
+            for (int64_t ch = 0; ch < ne02; ch++) {
                 ggml_vec_dot_i8_i8_batch_n8(
-                    out_ch, w_ch, inp_ch,
+                    acc_buf + ch * n_cols,
+                    weight_data + ch * ne00,
+                    input_base + (ch * ne11 + col0) * ne00,
                     ne00,    // KW
                     ne01,    // 1
                     1,       // single channel per call
                     ne00,    // ne10 = KW
-                    n_cols   // number of columns to process
-                );
+                    n_cols);
             }
 
-            // Convert int32 -> float with combined_scale + bias, store in float_buf
-            // acc_buf layout: [C, n_cols] (channel-major)
-            // dst layout: ne[0]=1, ne[1]=N, ne[2]=C => physical [C, N] (channel-major)
-            for (int64_t ch = 0; ch < C; ch++) {
-                for (int64_t c = 0; c < n_cols; c++) {
-                    float val = (float)acc_buf[ch * n_cols + c] * combined_scale + bias_data[ch];
-                    float_buf[ch * N_cols + (col0 + c)] = val;
-                    float av = val < 0.0f ? -val : val;
-                    if (av > local_absmax) local_absmax = av;
-                }
+            for (int64_t ch = 0; ch < ne02; ch++) {
+                local_absmax = ggml_i8_s_scale_bias_absmax(
+                    float_buf + ch * ne11 + col0, acc_buf + ch * n_cols,
+                    bias_data + ch, /*bias_stride =*/ 0,
+                    n_cols, combined_scale, local_absmax);
             }
+        } else {
+            // The tile kernel walks input columns with stride ne00.
+            GGML_ASSERT(src1->nb[1] == (size_t) ne00);
 
-        }
-
-        // Store local absmax for this thread
-        thread_max[ith] = local_absmax;
-
-        // --- Step 2: Barrier + global max reduction ---
-        ggml_barrier(params->threadpool);
-
-        if (ith == 0) {
-            float global_max = 0.0f;
-            for (int t = 0; t < nth; t++) {
-                if (thread_max[t] > global_max) global_max = thread_max[t];
-            }
-            thread_max[0] = global_max;
-        }
-
-        ggml_barrier(params->threadpool);
-
-        const float global_max = thread_max[0];
-
-        // --- Step 3: Quantize float -> int8 ---
-        const float inv_scale = (global_max != 0.0f) ? 127.0f / global_max : 0.0f;
-
-        if (col0 < col1) {
-            for (int64_t ch = 0; ch < C; ch++) {
-                for (int64_t c = col0; c < col1; c++) {
-                    float v = float_buf[ch * N_cols + c] * inv_scale;
-                    v = v < -127.0f ? -127.0f : (v > 127.0f ? 127.0f : v);
-                    ((int8_t *)dst->data)[ch * N_cols + c] = (int8_t)roundf(v);
-                }
-            }
-        }
-
-        // Thread 0 stores the per-tensor output scale
-        if (ith == 0) {
-            *(float *)((char *)dst->data + ggml_nelements(dst)) = (global_max != 0.0f) ? 127.0f / global_max : 0.0f;
-        }
-
-    } else {
-        // ===== Linear / Conv path =====
-        // src0: [IC, OC], src1: [IC, N], bias: [OC], dst: [OC, N]
-        // Output elements: OC * N
-        const int64_t n_out = ne01 * ne11;
-        const size_t nb11 = src1->nb[1];
-
-        // Shared work buffer layout:
-        //   [0 .. n_out-1]       : float results (OC * N floats)
-        //   [n_out .. n_out+nth-1] : per-thread absmax (nth floats)
-        float * float_buf  = (float *)params->wdata;
-        float * thread_max = float_buf + n_out;
-
-        // Parallelize over columns (N dimension)
-        const int64_t dr   = (ne11 + nth - 1) / nth;
-        const int64_t col0 = dr * ith;
-        const int64_t col1 = col0 + dr < ne11 ? col0 + dr : ne11;
-
-        // --- Step 1: GEMM + dequant + bias, find local absmax ---
-        float local_absmax = 0.0f;
-
-        if (col0 < col1) {
-            const int64_t n_cols = col1 - col0;
-
-            // Use pre-allocated int32 accumulator from work buffer
-            int32_t * acc_base = (int32_t *)(thread_max + nth);
-            int32_t * acc_buf = acc_base + col0 * ne01;
-            memset(acc_buf, 0, n_cols * ne01 * sizeof(int32_t));
-
-            const void * vx = (const void *)src0->data;
-            const void * vy = (const void *)((const char *)src1->data + col0 * nb11);
-
-            ggml_gemv_t const gemv = type_traits[GGML_TYPE_I8_S].gemv;
-            ggml_gemm_t const gemm = type_traits[GGML_TYPE_I8_S].gemm;
-
-            if (n_cols == 1) {
-                ((void (*)(int, int32_t*, size_t, const void*, const void*, int, int))gemv)(
-                    (int)ne00, acc_buf, (size_t)ne01, vx, vy, (int)n_cols, (int)ne01);
-            } else {
-                ((void (*)(int, int32_t*, size_t, const void*, const void*, int, int))gemm)(
-                    (int)ne00, acc_buf, (size_t)ne01, vx, vy, (int)n_cols, (int)ne01);
-            }
-
-
-            // Convert int32 -> float with combined_scale + bias, store in float_buf
-            for (int64_t c = 0; c < n_cols; c++) {
-                int32_t * col_acc = acc_buf + c * ne01;
-                for (int64_t oc = 0; oc < ne01; oc++) {
-                    float val = (float)col_acc[oc] * combined_scale + bias_data[oc];
-                    float_buf[(col0 + c) * ne01 + oc] = val;
-                    float av = val < 0.0f ? -val : val;
-                    if (av > local_absmax) local_absmax = av;
-                }
-            }
-
-        }
-
-        // Store local absmax for this thread
-        thread_max[ith] = local_absmax;
-
-        // --- Step 2: Barrier + global max reduction ---
-        ggml_barrier(params->threadpool);
-
-        if (ith == 0) {
-            float global_max = 0.0f;
-            for (int t = 0; t < nth; t++) {
-                if (thread_max[t] > global_max) global_max = thread_max[t];
-            }
-            thread_max[0] = global_max;
-        }
-
-        ggml_barrier(params->threadpool);
-
-        const float global_max = thread_max[0];
-
-        // --- Step 3: Quantize float -> int8 ---
-        const float inv_scale = (global_max != 0.0f) ? 127.0f / global_max : 0.0f;
-
-        if (col0 < col1) {
-            for (int64_t c = col0; c < col1; c++) {
-                for (int64_t oc = 0; oc < ne01; oc++) {
-                    float v = float_buf[c * ne01 + oc] * inv_scale;
-                    v = v < -127.0f ? -127.0f : (v > 127.0f ? 127.0f : v);
-                    ((int8_t *)dst->data)[c * ne01 + oc] = (int8_t)roundf(v);
-                }
-            }
-        }
-
-        // Thread 0 stores the per-tensor output scale
-        if (ith == 0) {
-            *(float *)((char *)dst->data + ggml_nelements(dst)) = (global_max != 0.0f) ? 127.0f / global_max : 0.0f;
+            local_absmax = ggml_i8_s_gemm_fused(
+                float_buf, (const int8_t *)src0->data, (const int8_t *)src1->data,
+                bias_data, ne00, ne01, col0, col1,
+                combined_scale, local_absmax);
         }
     }
+
+    // --- Step 2: global absmax across threads ---
+    const float global_max = ggml_i8_s_reduce_absmax(params, thread_max, local_absmax);
+    const float inv_scale  = (global_max != 0.0f) ? 127.0f / global_max : 0.0f;
+
+    // --- Step 3: quantize f32 -> int8 ---
+    if (n_cols > 0) {
+        if (depthwise) {
+            for (int64_t ch = 0; ch < ne02; ch++) {
+                ggml_i8_s_quantize_range((int8_t *)dst->data + ch * ne11 + col0,
+                    float_buf + ch * ne11 + col0, n_cols, inv_scale, relu);
+            }
+        } else {
+            ggml_i8_s_quantize_range((int8_t *)dst->data + col0 * ne01,
+                float_buf + col0 * ne01, n_cols * ne01, inv_scale, relu);
+        }
+    }
+
+    // Thread 0 stores the per-tensor output scale
+    if (ith == 0) {
+        *(float *)((char *)dst->data + ggml_nelements(dst)) = inv_scale;
+    }
+}
+
+static void ggml_compute_forward_mul_mat_add(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    ggml_compute_forward_mul_mat_add_impl(params, dst, /*relu =*/ false);
 }
 
 static void ggml_compute_forward_mul_mat_add_relu(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
-
-    const struct ggml_tensor * src0 = dst->src[0];  // weight
-    const struct ggml_tensor * src1 = dst->src[1];  // input
-    const struct ggml_tensor * src2 = dst->src[2];  // bias (F32)
-
-    GGML_ASSERT(src0->type == GGML_TYPE_I8_S);
-
-    const int64_t ne00 = src0->ne[0];
-    const int64_t ne01 = src0->ne[1];
-    const int64_t ne02 = src0->ne[2];
-    const int64_t ne11 = src1->ne[1];
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    const float * bias_data = (const float *)src2->data;
-
-    const float w_scale   = *(const float *)((const char *)src0->data + ggml_nelements(src0));
-    const float inp_scale = *(const float *)((const char *)src1->data + ggml_nelements(src1));
-    const float combined_scale = w_scale / inp_scale;
-
-    if (ne01 == 1 && ne02 > 1) {
-
-        const int64_t C = ne02;
-        const int64_t N_cols = ne11;
-        const int64_t n_out = N_cols * C;
-
-        float * float_buf  = (float *)params->wdata;
-        float * thread_max = float_buf + n_out;
-
-        const int64_t dr   = (N_cols + nth - 1) / nth;
-        const int64_t col0 = dr * ith;
-        const int64_t col1 = col0 + dr < N_cols ? col0 + dr : N_cols;
-
-        float local_absmax = 0.0f;
-
-        if (col0 < col1) {
-            const int64_t n_cols = col1 - col0;
-
-            int32_t * acc_base = (int32_t *)(thread_max + nth);
-            int32_t * acc_buf = acc_base + col0 * C;
-            memset(acc_buf, 0, n_cols * C * sizeof(int32_t));
-
-            const int8_t * weight_data = (const int8_t *)src0->data;
-            const int8_t * input_base  = (const int8_t *)src1->data;
-
-            for (int64_t ch = 0; ch < C; ch++) {
-                const int8_t * w_ch   = weight_data + ch * ne00;
-                const int8_t * inp_ch = input_base + ch * N_cols * ne00 + col0 * ne00;
-                int32_t * out_ch      = acc_buf + ch * n_cols;
-
-                ggml_vec_dot_i8_i8_batch_n8(
-                    out_ch, w_ch, inp_ch,
-                    ne00, ne01, 1, ne00, n_cols
-                );
-            }
-
-            for (int64_t ch = 0; ch < C; ch++) {
-                for (int64_t c = 0; c < n_cols; c++) {
-                    float val = (float)acc_buf[ch * n_cols + c] * combined_scale + bias_data[ch];
-                    float_buf[ch * N_cols + (col0 + c)] = val;
-                    float av = val < 0.0f ? -val : val;
-                    if (av > local_absmax) local_absmax = av;
-                }
-            }
-        }
-
-        thread_max[ith] = local_absmax;
-
-        ggml_barrier(params->threadpool);
-
-        if (ith == 0) {
-            float global_max = 0.0f;
-            for (int t = 0; t < nth; t++) {
-                if (thread_max[t] > global_max) global_max = thread_max[t];
-            }
-            thread_max[0] = global_max;
-        }
-
-        ggml_barrier(params->threadpool);
-
-        const float global_max = thread_max[0];
-        const float inv_scale = (global_max != 0.0f) ? 127.0f / global_max : 0.0f;
-
-        if (col0 < col1) {
-            for (int64_t ch = 0; ch < C; ch++) {
-                for (int64_t c = col0; c < col1; c++) {
-                    float v = float_buf[ch * N_cols + c] * inv_scale;
-                    v = v < -127.0f ? -127.0f : (v > 127.0f ? 127.0f : v);
-                    int8_t q = (int8_t)roundf(v);
-                    ((int8_t *)dst->data)[ch * N_cols + c] = q < 0 ? 0 : q;
-                }
-            }
-        }
-
-        if (ith == 0) {
-            *(float *)((char *)dst->data + ggml_nelements(dst)) = (global_max != 0.0f) ? 127.0f / global_max : 0.0f;
-        }
-
-    } else {
-        const int64_t n_out = ne01 * ne11;
-        const size_t nb11 = src1->nb[1];
-
-        float * float_buf  = (float *)params->wdata;
-        float * thread_max = float_buf + n_out;
-
-        const int64_t dr   = (ne11 + nth - 1) / nth;
-        const int64_t col0 = dr * ith;
-        const int64_t col1 = col0 + dr < ne11 ? col0 + dr : ne11;
-
-        float local_absmax = 0.0f;
-
-        if (col0 < col1) {
-            const int64_t n_cols = col1 - col0;
-
-            int32_t * acc_base = (int32_t *)(thread_max + nth);
-            int32_t * acc_buf = acc_base + col0 * ne01;
-            memset(acc_buf, 0, n_cols * ne01 * sizeof(int32_t));
-
-            const void * vx = (const void *)src0->data;
-            const void * vy = (const void *)((const char *)src1->data + col0 * nb11);
-
-            ggml_gemv_t const gemv = type_traits[GGML_TYPE_I8_S].gemv;
-            ggml_gemm_t const gemm = type_traits[GGML_TYPE_I8_S].gemm;
-
-            if (n_cols == 1) {
-                ((void (*)(int, int32_t*, size_t, const void*, const void*, int, int))gemv)(
-                    (int)ne00, acc_buf, (size_t)ne01, vx, vy, (int)n_cols, (int)ne01);
-            } else {
-                ((void (*)(int, int32_t*, size_t, const void*, const void*, int, int))gemm)(
-                    (int)ne00, acc_buf, (size_t)ne01, vx, vy, (int)n_cols, (int)ne01);
-            }
-
-            for (int64_t c = 0; c < n_cols; c++) {
-                int32_t * col_acc = acc_buf + c * ne01;
-                for (int64_t oc = 0; oc < ne01; oc++) {
-                    float val = (float)col_acc[oc] * combined_scale + bias_data[oc];
-                    float_buf[(col0 + c) * ne01 + oc] = val;
-                    float av = val < 0.0f ? -val : val;
-                    if (av > local_absmax) local_absmax = av;
-                }
-            }
-        }
-
-        thread_max[ith] = local_absmax;
-
-        ggml_barrier(params->threadpool);
-
-        if (ith == 0) {
-            float global_max = 0.0f;
-            for (int t = 0; t < nth; t++) {
-                if (thread_max[t] > global_max) global_max = thread_max[t];
-            }
-            thread_max[0] = global_max;
-        }
-
-        ggml_barrier(params->threadpool);
-
-        const float global_max = thread_max[0];
-        const float inv_scale = (global_max != 0.0f) ? 127.0f / global_max : 0.0f;
-
-        if (col0 < col1) {
-            for (int64_t c = col0; c < col1; c++) {
-                for (int64_t oc = 0; oc < ne01; oc++) {
-                    float v = float_buf[c * ne01 + oc] * inv_scale;
-                    v = v < -127.0f ? -127.0f : (v > 127.0f ? 127.0f : v);
-                    int8_t q = (int8_t)roundf(v);
-                    ((int8_t *)dst->data)[c * ne01 + oc] = q < 0 ? 0 : q;
-                }
-            }
-        }
-
-        if (ith == 0) {
-            *(float *)((char *)dst->data + ggml_nelements(dst)) = (global_max != 0.0f) ? 127.0f / global_max : 0.0f;
-        }
-    }
+    ggml_compute_forward_mul_mat_add_impl(params, dst, /*relu =*/ true);
 }
 
 

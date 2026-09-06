@@ -1223,46 +1223,41 @@ void ggml_gemm_i8_i8(int n, int32_t * GGML_RESTRICT s, size_t bs, const void * G
     }
 #endif
 
-#if defined(VAE_ACT_PARALLEL)
-    const int64_t row_block = VAE_ROW_BLOCK_SIZE;
-    const int64_t col_block = VAE_COL_BLOCK_SIZE;
+    // Generic tile kernel: no cache blocking here, the caller owns the tile
+    // geometry (ggml_i8_s_gemm_fused in ggml.c) so that it can fuse the dequant
+    // epilogue into each tile. The batched kernels below consume n in whole
+    // QK_I8_S blocks and silently drop any remainder; the shapes with a smaller
+    // n are covered by the specializations above.
+    GGML_ASSERT(n % QK_I8_S == 0);
 
-    for (int64_t c0 = 0; c0 < nc; c0 += col_block) {
-        int64_t cur_c = (c0 + col_block <= nc) ? col_block : (nc - c0);
-        for (int64_t r0 = 0; r0 < nr; r0 += row_block) {
-            int64_t cur_r = (r0 + row_block <= nr) ? row_block : (nr - r0);
-            const void * vy_r = (const int8_t *)vy + r0 * n;
-            for (int64_t c = 0; c < cur_c; ++c) {
-                const int64_t col = c0 + c;
-                int32_t * s_col = s + col;
-                const void * vx_col = (const int8_t *)vx + col * n;
-                if (cur_r % VAE_PARALLEL_SIZE == 0) {
-                    ggml_vec_dot_i8_i8(n, s_col + r0 * bs, bs, vx_col, n, vy_r, n, cur_r);
-                } else {
-                    // nrc=1 per call avoids 1x1 path misinterpreting vx as multi-row
-                    for (int64_t r = 0; r < cur_r; ++r) {
-                        const int8_t * vy_row = (const int8_t *)vy_r + r * n;
-                        ggml_vec_dot_i8_i8(n, s_col + (r0 + r) * bs, 0,
-                            vx_col, 0, vy_row, 0, 1);
-                    }
-                }
+#if defined(VAE_ACT_PARALLEL)
+    // One weight row against all nr activation columns, results strided by bs.
+    for (int64_t c = 0; c < nc; ++c) {
+        int32_t      * s_col  = s + c;
+        const int8_t * vx_col = (const int8_t *)vx + c * n;
+
+        if (nr % VAE_PARALLEL_SIZE == 0) {
+            ggml_vec_dot_i8_i8(n, s_col, bs, vx_col, n, vy, n, nr);
+        } else {
+            // nrc=1 per call avoids 1x1 path misinterpreting vx as multi-row
+            for (int64_t r = 0; r < nr; ++r) {
+                ggml_vec_dot_i8_i8(n, s_col + r * bs, 0, vx_col, 0,
+                    (const int8_t *)vy + r * n, 0, 1);
             }
         }
     }
 #else
-    const int64_t row_block = VAE_ROW_BLOCK_SIZE;
-    const int64_t col_block = VAE_COL_BLOCK_SIZE;
+    // One activation column against all nc weight rows, results contiguous.
+    for (int64_t r = 0; r < nr; ++r) {
+        int32_t      * s_row  = s + r * bs;
+        const int8_t * vy_row = (const int8_t *)vy + r * n;
 
-    for (int64_t r0 = 0; r0 < nr; r0 += row_block) {
-        int64_t cur_r = (r0 + row_block <= nr) ? row_block : (nr - r0);
-        for (int64_t c0 = 0; c0 < nc; c0 += col_block) {
-            int64_t cur_c = (c0 + col_block <= nc) ? col_block : (nc - c0);
-            const void * vx_c = (const int8_t *)vx + c0 * n;
-            for (int64_t r = 0; r < cur_r; ++r) {
-                const int64_t row = r0 + r;
-                int32_t * s_row = s + row * bs;
-                const void * vy_row = (const int8_t *)vy + row * n;
-                ggml_vec_dot_i8_i8(n, s_row + c0, bs, vx_c, n, vy_row, n, cur_c);
+        if (nc % VAE_PARALLEL_SIZE == 0) {
+            ggml_vec_dot_i8_i8(n, s_row, bs, vx, n, vy_row, n, nc);
+        } else {
+            for (int64_t c = 0; c < nc; ++c) {
+                ggml_vec_dot_i8_i8(n, s_row + c, 0,
+                    (const int8_t *)vx + c * n, 0, vy_row, 0, 1);
             }
         }
     }
