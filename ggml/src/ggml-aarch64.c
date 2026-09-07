@@ -1081,153 +1081,49 @@ void ggml_gemm_i2_i8_s(int n, float * GGML_RESTRICT s, size_t bs, const void * G
 #endif
 }
 
+// Run whole COLS-wide column groups of an n == N tile through KERNEL, and a
+// short trailing group through the generic 1x1 path one column at a time.
+// KERNEL consumes one SIMD register of weights per call, so COLS is QK_I8_S / N;
+// N == QK_I8_S needs no specialization and is eliminated at compile time.
+#define GGML_I8_S_SPECIALIZE(N, KERNEL)                                    \
+    if ((N) < QK_I8_S && n == (N) && nc >= QK_I8_S / (N)) {                \
+        const int64_t cols  = QK_I8_S / (N);                               \
+        const int8_t * vx_i8 = (const int8_t *)vx;                         \
+        const int8_t * vy_i8 = (const int8_t *)vy;                         \
+                                                                           \
+        for (int64_t c0 = 0; c0 < nc; c0 += cols) {                        \
+            int64_t cur_c = (c0 + cols <= nc) ? cols : (nc - c0);          \
+            const int8_t * vx_c = vx_i8 + c0 * n;                          \
+                                                                           \
+            if (cur_c == cols) {                                           \
+                KERNEL(s + c0, bs, vx_c, vy_i8, nr);                       \
+            } else {                                                       \
+                for (int64_t r = 0; r < nr; ++r) {                         \
+                    const int8_t * vy_row = vy_i8 + r * n;                 \
+                    for (int64_t cc = 0; cc < cur_c; ++cc) {               \
+                        ggml_vec_dot_i8_i8(n, s + r * bs + c0 + cc, 0,     \
+                            vx_i8 + (c0 + cc) * n, 0, vy_row, 0, 1);       \
+                    }                                                      \
+                }                                                          \
+            }                                                              \
+        }                                                                  \
+        return;                                                            \
+    }
+
 void ggml_gemm_i8_i8(int n, int32_t * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
 
-#if defined(__AVX2__) || defined(__AVX__)
-    if (n == 2 && nc >= 16) {
-        const int8_t * vx_i8 = (const int8_t *)vx;
-        const int8_t * vy_i8 = (const int8_t *)vy;
-
-        for (int64_t c0 = 0; c0 < nc; c0 += 16) {
-            int64_t cur_c = (c0 + 16 <= nc) ? 16 : (nc - c0);
-            const int8_t * vx_c = vx_i8 + c0 * n;
-
-            if (cur_c == 16) {
-                ggml_vec_dot_i8_i8_n2_col16(s + c0, bs, vx_c, n, vy_i8, nr);
-            } else {
-                for (int64_t r = 0; r < nr; ++r) {
-                    const int8_t * vy_row = vy_i8 + r * n;
-                    for (int64_t cc = 0; cc < cur_c; ++cc) {
-                        ggml_vec_dot_i8_i8(n, s + r * bs + c0 + cc, 0,
-                            vx_i8 + (c0 + cc) * n, 0, vy_row, 0, 1);
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    if (n == 4 && nc >= 8) {
-        const int8_t * vx_i8 = (const int8_t *)vx;
-        const int8_t * vy_i8 = (const int8_t *)vy;
-
-        for (int64_t c0 = 0; c0 < nc; c0 += 8) {
-            int64_t cur_c = (c0 + 8 <= nc) ? 8 : (nc - c0);
-            const int8_t * vx_c = vx_i8 + c0 * n;
-
-            if (cur_c == 8) {
-                ggml_vec_dot_i8_i8_n4_col8(s + c0, bs, vx_c, n, vy_i8, nr);
-            } else {
-                for (int64_t r = 0; r < nr; ++r) {
-                    const int8_t * vy_row = vy_i8 + r * n;
-                    for (int64_t cc = 0; cc < cur_c; ++cc) {
-                        ggml_vec_dot_i8_i8(n, s + r * bs + c0 + cc, 0,
-                            vx_i8 + (c0 + cc) * n, 0, vy_row, 0, 1);
-                    }
-                }
-            }
-        }
-        return;
-    }
-    
-    if (n == 8 && nc >= 4) {
-        const int8_t * vx_i8 = (const int8_t *)vx;
-        const int8_t * vy_i8 = (const int8_t *)vy;
-
-        for (int64_t c0 = 0; c0 < nc; c0 += 4) {
-            int64_t cur_c = (c0 + 4 <= nc) ? 4 : (nc - c0);
-            const int8_t * vx_c = vx_i8 + c0 * n;
-
-            if (cur_c == 4) {
-                ggml_vec_dot_i8_i8_n8_col4(s + c0, bs, vx_c, n, vy_i8, nr);
-            } else {
-                for (int64_t r = 0; r < nr; ++r) {
-                    const int8_t * vy_row = vy_i8 + r * n;
-                    for (int64_t cc = 0; cc < cur_c; ++cc) {
-                        ggml_vec_dot_i8_i8(n, s + r * bs + c0 + cc, 0,
-                            vx_i8 + (c0 + cc) * n, 0, vy_row, 0, 1);
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    if (n == 16 && nc >= 2) {
-        const int8_t * vx_i8 = (const int8_t *)vx;
-        const int8_t * vy_i8 = (const int8_t *)vy;
-        
-        for (int64_t c0 = 0; c0 < nc; c0 += 2) {
-            int64_t cur_c = (c0 + 2 <= nc) ? 2 : (nc - c0);
-            const int8_t * vx_c = vx_i8 + c0 * n;
-            
-            if (cur_c == 2) {
-                ggml_vec_dot_i8_i8_n16_col2(s + c0, bs, vx_c, n, vy_i8, nr);
-            } else {
-                for (int64_t r = 0; r < nr; ++r) {
-                    const int8_t * vy_row = vy_i8 + r * n;
-                    for (int64_t cc = 0; cc < cur_c; ++cc) {
-                        ggml_vec_dot_i8_i8(n, s + r * bs + c0 + cc, 0,
-                            vx_i8 + (c0 + cc) * n, 0, vy_row, 0, 1);
-                    }
-                }
-            }
-        }
-        return;
-    }
-#elif defined(__ARM_NEON)
-    if (n == 4 && nc >= 2) {
-        const int8_t * vx_i8 = (const int8_t *)vx;
-        const int8_t * vy_i8 = (const int8_t *)vy;
-
-        for (int64_t c0 = 0; c0 < nc; c0 += 2) {
-            int64_t cur_c = (c0 + 2 <= nc) ? 2 : (nc - c0);
-            const int8_t * vx_c = vx_i8 + c0 * n;
-
-            if (cur_c == 2) {
-                ggml_vec_dot_i8_i8_n4_col2(s + c0, bs, vx_c, n, vy_i8, nr);
-            } else {
-                for (int64_t r = 0; r < nr; ++r) {
-                    const int8_t * vy_row = vy_i8 + r * n;
-                    for (int64_t cc = 0; cc < cur_c; ++cc) {
-                        ggml_vec_dot_i8_i8(n, s + r * bs + c0 + cc, 0,
-                            vx_i8 + (c0 + cc) * n, 0, vy_row, 0, 1);
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    if (n == 2 && nc >= 4) {
-        const int8_t * vx_i8 = (const int8_t *)vx;
-        const int8_t * vy_i8 = (const int8_t *)vy;
-
-        for (int64_t c0 = 0; c0 < nc; c0 += 4) {
-            int64_t cur_c = (c0 + 4 <= nc) ? 4 : (nc - c0);
-            const int8_t * vx_c = vx_i8 + c0 * n;
-
-            if (cur_c == 4) {
-                ggml_vec_dot_i8_i8_n2_col4(s + c0, bs, vx_c, n, vy_i8, nr);
-            } else {
-                for (int64_t r = 0; r < nr; ++r) {
-                    const int8_t * vy_row = vy_i8 + r * n;
-                    for (int64_t cc = 0; cc < cur_c; ++cc) {
-                        ggml_vec_dot_i8_i8(n, s + r * bs + c0 + cc, 0,
-                            vx_i8 + (c0 + cc) * n, 0, vy_row, 0, 1);
-                    }
-                }
-            }
-        }
-        return;
-    }
-#endif
+    // Pure performance table: every shape it declines is still handled correctly
+    // by the generic path below, just slower.
+    GGML_I8_S_SPECIALIZE( 2, ggml_vec_dot_i8_i8_n2)
+    GGML_I8_S_SPECIALIZE( 4, ggml_vec_dot_i8_i8_n4)
+    GGML_I8_S_SPECIALIZE( 8, ggml_vec_dot_i8_i8_n8)
+    GGML_I8_S_SPECIALIZE(16, ggml_vec_dot_i8_i8_n16)
 
     // Generic tile kernel: no cache blocking here, the caller owns the tile
     // geometry (ggml_i8_s_gemm_fused in ggml.c) so that it can fuse the dequant
-    // epilogue into each tile. The batched kernels below consume n in whole
-    // QK_I8_S blocks and silently drop any remainder; the shapes with a smaller
-    // n are covered by the specializations above.
+    // epilogue into each tile. The batched kernels below handle a partial
+    // trailing block scalar-wise, so this assert is a tuning guard rather than a
+    // correctness one: tripping it means a shape wants its own specialization.
     GGML_ASSERT(n % QK_I8_S == 0);
 
 #if defined(VAE_ACT_PARALLEL)
@@ -1263,6 +1159,8 @@ void ggml_gemm_i8_i8(int n, int32_t * GGML_RESTRICT s, size_t bs, const void * G
     }
 #endif
 }
+
+#undef GGML_I8_S_SPECIALIZE
 
 void ggml_gemm_q4_0_4x4_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, const void * restrict vy, int nr, int nc) {
     const int qk = QK8_0;
