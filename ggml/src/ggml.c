@@ -19323,12 +19323,11 @@ static void ggml_compute_forward_mul_mat_add_impl(
             const int8_t * input_base  = (const int8_t *)src1->data;
 
             for (int64_t ch = 0; ch < ne02; ch++) {
-                ggml_vec_dot_i8_i8_batch_n8(
+                ggml_vec_dot_i8_i8_depthwise(
                     acc_buf + ch * n_cols,
                     weight_data + ch * ne00,
                     input_base + (ch * ne11 + col0) * ne00,
                     ne00,    // KW
-                    ne01,    // 1
                     1,       // single channel per call
                     ne00,    // ne10 = KW
                     n_cols);
