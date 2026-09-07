@@ -3120,9 +3120,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS",
     "CROSS_ENTROPY_LOSS_BACK",
     "OPT_STEP_ADAMW",
+
+    "I8_S_CONCAT",
 };
 
-static_assert(GGML_OP_COUNT == 87, "GGML_OP_COUNT != 87");
+static_assert(GGML_OP_COUNT == 88, "GGML_OP_COUNT != 88");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -3221,9 +3223,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cross_entropy_loss(x,y)",
     "cross_entropy_loss_back(x,y)",
     "adamw(x)",
+
+    "i8_s_concat(x,y)",
 };
 
-static_assert(GGML_OP_COUNT == 87, "GGML_OP_COUNT != 87");
+static_assert(GGML_OP_COUNT == 88, "GGML_OP_COUNT != 88");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4982,6 +4986,28 @@ struct ggml_tensor * ggml_add_scaled(
     result->src[0] = a;
     result->src[1] = b;
     result->src[2] = scale;
+
+    return result;
+}
+
+// ggml_i8_s_concat
+
+struct ggml_tensor * ggml_i8_s_concat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_I8_S);
+    GGML_ASSERT(b->type == GGML_TYPE_I8_S);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(b));
+    GGML_ASSERT(a->ne[1] == b->ne[1] && a->ne[2] == b->ne[2] && a->ne[3] == b->ne[3]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I8_S,
+            a->ne[0] + b->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+
+    result->op     = GGML_OP_I8_S_CONCAT;
+    result->src[0] = a;
+    result->src[1] = b;
 
     return result;
 }
@@ -18696,6 +18722,81 @@ static void ggml_compute_forward_opt_step_adamw(
 // VibeASR custom operators
 /////////////////////////////////
 
+// ggml_compute_forward_i8_s_concat
+//
+// I8_S carries one f32 scale per tensor (stored after the int8 data), so two
+// independently quantized tensors cannot simply be memcpy'd into one buffer.
+// Both hold values in [-max, max] with max = 127/inv_scale, so the union needs
+// max_out = max(max_a, max_b), i.e. inv_scale_out = min(inv_scale_a, inv_scale_b)
+// and each side is rescaled by inv_scale_out/inv_scale, which is <= 1 - no
+// clipping, and the wider side is copied through unchanged.
+//
+// An inv_scale of 0 means that tensor was all zeros (absmax 0); it must not
+// drag the shared scale to 0, so it is ignored when taking the min.
+
+static void ggml_compute_forward_i8_s_concat(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_I8_S);
+    GGML_ASSERT(src1->type == GGML_TYPE_I8_S);
+    GGML_ASSERT(dst->type  == GGML_TYPE_I8_S);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t na = src0->ne[0];
+    const int64_t nb = src1->ne[0];
+    const int64_t nrow = ggml_nelements(dst) / dst->ne[0];
+
+    const float sa = *(const float *)((const char *)src0->data + ggml_nelements(src0));
+    const float sb = *(const float *)((const char *)src1->data + ggml_nelements(src1));
+
+    float s_out;
+    if (sa == 0.0f)      s_out = sb;
+    else if (sb == 0.0f) s_out = sa;
+    else                 s_out = sa < sb ? sa : sb;
+
+    const float ra = (sa != 0.0f) ? s_out / sa : 0.0f;
+    const float rb = (sb != 0.0f) ? s_out / sb : 0.0f;
+
+    const int8_t * a_data = (const int8_t *)src0->data;
+    const int8_t * b_data = (const int8_t *)src1->data;
+    int8_t       * d_data = (int8_t       *)dst->data;
+
+    const int64_t dr = (nrow + nth - 1) / nth;
+    const int64_t r0 = dr * ith;
+    const int64_t r1 = MIN(r0 + dr, nrow);
+
+    for (int64_t r = r0; r < r1; r++) {
+        const int8_t * ar = a_data + r * na;
+        const int8_t * br = b_data + r * nb;
+        int8_t       * dr0 = d_data + r * (na + nb);
+
+        if (ra == 1.0f) {
+            memcpy(dr0, ar, na);
+        } else {
+            for (int64_t i = 0; i < na; i++) {
+                dr0[i] = (int8_t) lroundf((float)ar[i] * ra);
+            }
+        }
+        if (rb == 1.0f) {
+            memcpy(dr0 + na, br, nb);
+        } else {
+            for (int64_t i = 0; i < nb; i++) {
+                dr0[na + i] = (int8_t) lroundf((float)br[i] * rb);
+            }
+        }
+    }
+
+    if (ith == 0) {
+        *(float *)((char *)dst->data + ggml_nelements(dst)) = s_out;
+    }
+}
+
 // ggml_compute_forward_add_scaled
 
 static void ggml_compute_forward_add_scaled(
@@ -19412,6 +19513,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_ADD_SCALED:
             {
                 ggml_compute_forward_add_scaled(params, tensor);
+            } break;
+        case GGML_OP_I8_S_CONCAT:
+            {
+                ggml_compute_forward_i8_s_concat(params, tensor);
             } break;
         case GGML_OP_ACC:
             {
@@ -20921,6 +21026,7 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
                 GGML_ABORT("fatal error"); // not supported
             }
         case GGML_OP_ADD_SCALED:
+        case GGML_OP_I8_S_CONCAT:
         case GGML_OP_MUL_MAT_ADD:
         case GGML_OP_MUL_MAT_ADD_RELU:
         case GGML_OP_RMS_NORM_SCALED:
@@ -21472,6 +21578,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT_ADD_RELU:
         case GGML_OP_OUT_PROD:
         case GGML_OP_ADD_SCALED:
+        case GGML_OP_I8_S_CONCAT:
             {
                 n_tasks = n_threads;
             } break;

@@ -539,6 +539,8 @@ extern "C" {
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
         GGML_OP_OPT_STEP_ADAMW,
 
+        GGML_OP_I8_S_CONCAT, // concat two I8_S tensors along dim 0, requantizing to a shared scale
+
         GGML_OP_COUNT,
     };
 
@@ -895,6 +897,15 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             struct ggml_tensor  * scale);
+
+    // Concatenate two I8_S tensors along dim 0, rescaling to a common
+    // per-tensor scale. Needed by the streaming VAE encoder: the cached left
+    // context and the new chunk are quantized independently, so a byte-wise
+    // concat would mix two different scales in one tensor.
+    GGML_API struct ggml_tensor * ggml_i8_s_concat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
 
     GGML_API struct ggml_tensor * ggml_add1(
             struct ggml_context * ctx,
